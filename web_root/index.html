@@ -1,4 +1,22 @@
+
 <script src="htmx.js"></script>
-<button hx-post="/clicked" hx-swap="outerHTML">
-Click Me
+
+<div id="parent-div">
+aksjdhaksjd
+</div>
+
+<button hx-post="/read"
+    hx-trigger=click
+    hx-target="#parent-div"
+    hx-swap="innerHTML">
+    Read
 </button>
+
+<form>
+    <input type="text" name="text"/>
+    <button hx-post="/insert"
+        hx-trigger="click"
+        hx-swap="none">
+        Insert
+    </button>
+</form>
