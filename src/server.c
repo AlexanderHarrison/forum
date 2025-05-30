@@ -142,7 +142,7 @@ int main(void) {
 
     struct mg_mgr mgr;
     mg_mgr_init(&mgr);
-    mg_http_listen(&mgr, "http://0.0.0.0:8000", ev_handler, NULL);
+    mg_http_listen(&mgr, "http://0.0.0.0:10000", ev_handler, NULL);
     while (true) {
         mg_mgr_poll(&mgr, -1);
     }
