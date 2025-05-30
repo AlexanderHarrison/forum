@@ -1,22 +1,19 @@
 
 <script src="htmx.js"></script>
+<script src="htmx-ws.js"></script>
 
-<div id="parent-div">
-aksjdhaksjd
+<div id="chat"></div>
+<hr>
+<div hx-ext="ws"
+    ws-connect="/ws"
+>
+    <form id="post-message" ws-send>
+        <label for="username">Username:</label>
+        <input type="text" id="username" name="username"/><br>
+        
+        <label for="message">Message:</label>
+        <input type="text" id="message" name="message"/><br>
+        
+        <input type="submit" value="Post!"/>
+    </form>
 </div>
-
-<button hx-post="/read"
-    hx-trigger=click
-    hx-target="#parent-div"
-    hx-swap="innerHTML">
-    Read
-</button>
-
-<form>
-    <input type="text" name="text"/>
-    <button hx-post="/insert"
-        hx-trigger="click"
-        hx-swap="none">
-        Insert
-    </button>
-</form>
