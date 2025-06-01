@@ -1,16 +1,11 @@
 
-<script src="htmx.js"></script>
-<script src="htmx-ws.js"></script>
+<script src="/htmx.js"></script>
+<script src="/htmx-ws.js"></script>
 
 <div id="chat"></div>
 <hr>
-<div hx-ext="ws"
-    ws-connect="/ws"
->
+<div hx-ext="ws" ws-connect="/ws">
     <form id="post-message" ws-send>
-        <label for="username">Username:</label>
-        <input type="text" id="username" name="username"/><br>
-        
         <label for="message">Message:</label>
         <input type="text" id="message" name="message"/><br>
         

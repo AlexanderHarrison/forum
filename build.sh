@@ -17,7 +17,7 @@ mkdir -p build
 if [ ! -f build/mongoose.o ]; then /usr/bin/gcc -O2 -c vendor/mongoose.c -o build/mongoose.o; fi
 if [ ! -f build/sqlite3.o  ]; then /usr/bin/gcc -O2 -c vendor/sqlite3.c  -o build/sqlite3.o ; fi
 
-/usr/bin/c99 ${WARN_FLAGS} ${PATH_FLAGS} ${BASE_FLAGS} build/sqlite3.o build/mongoose.o src/server.c ${LINK_FLAGS} -o build/server
+/usr/bin/gcc ${WARN_FLAGS} ${PATH_FLAGS} ${BASE_FLAGS} build/sqlite3.o build/mongoose.o src/server.c ${LINK_FLAGS} -o build/server
 
 if [ "$1" = 'release' ]; then
     strip server

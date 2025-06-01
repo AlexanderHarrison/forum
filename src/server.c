@@ -1,19 +1,71 @@
 #include "../vendor/mongoose.h"
 #include "../vendor/sqlite3.h"
 
+#include "utils.c"
+
 #include <stdbool.h>
 #include <stdio.h>
 
 sqlite3 *db;
-sqlite3_stmt *insert_stmt;
-sqlite3_stmt *read_stmt;
+sqlite3_stmt *stmt_post_message;
+sqlite3_stmt *stmt_signup;
+sqlite3_stmt *stmt_login;
+sqlite3_stmt *stmt_read_history;
+sqlite3_stmt *stmt_username_id;
+sqlite3_stmt *stmt_email_id;
+sqlite3_stmt *stmt_get_user;
+sqlite3_stmt *stmt_add_session;
+sqlite3_stmt *stmt_session_user;
 
-#define expect(A) do {\
-    if (!(A)) {\
-        fprintf(stderr, "expect failed - " __FILE__ ":%u: '" #A "'\n", __LINE__);\
-        exit(1);\
-    }\
-} while (0)
+static const char sql_post_message[] = "INSERT INTO chatlog VALUES ( ?, ? );";
+static const char sql_signup[] = "INSERT INTO users VALUES ( ?, ?, ?, ?, ? );";
+static const char sql_login[] = "SELECT user_id FROM users WHERE ( login_hash = ? );";
+static const char sql_read_history[] = "SELECT user_id, message FROM chatlog;";
+static const char sql_username_id[] = "SELECT user_id FROM users WHERE ( username = ? );";
+static const char sql_email_id[] = "SELECT user_id FROM users WHERE ( email = ? );";
+static const char sql_get_user[] = "SELECT * FROM users WHERE ( user_id = ? );";
+static const char sql_add_session[] = "INSERT INTO sessions VALUES ( ?, ? );";
+static const char sql_session_user[] = "SELECT user_id FROM sessions WHERE ( session_id = ? );";
+
+Arena *ev_arena;
+
+typedef U64 ID;
+
+typedef struct User {
+    ID id;
+    Str username;
+    Str email;
+    U64 login_salt;
+    U64 login_hash;
+} User;
+
+// simple ascii encoding a..=p
+ID parse_id(Str str) {
+    if (str.len != 16) return 0;
+    U64 id = 0;
+    for (size_t i = 0; i < str.len; ++i) {
+        U64 c = (U64)str.buf[i];
+        id |= (c & 0xF) << (i * 4);
+    }
+    return id;
+}
+
+Str format_id(Arena *arena, ID id) {
+    char *str = arena_alloc(arena, 16, 1);
+    for (size_t i = 0; i < 16; ++i) {
+        U64 nib = (id >> (i * 4)) & 0xF;
+        str[i] = (char)(0x60ull | nib);
+    }
+    
+    return (Str) { str, 16 };
+}
+
+int sql_bind_str(sqlite3_stmt *stmt, int index, Str str) {
+    return sqlite3_bind_text(stmt, index, str.buf, (int)str.len, NULL);
+}
+int sql_bind_uint(sqlite3_stmt *stmt, int index, U64 n) {
+    return sqlite3_bind_int64(stmt, index, (sqlite_int64)n);
+}
 
 void mg_print_str(const char *preface, struct mg_str str) {
     printf("%s%.*s\n", preface, (int) str.len, str.buf);
@@ -32,110 +84,323 @@ void mg_bad_request(struct mg_connection *c) {
     mg_http_reply(c, 400, NULL, "");
 }
 
-void insert_row(const char *username, const char *message) {
-    printf("%s - %s\n", username, message);
+void mg_http_redirect(struct mg_connection *c, const char *path) {
+    const char *headers = "Content-Type: text/html; charset=utf-8\r\n";
+    mg_http_reply(c, 200, headers,"<meta charset=\"utf-8\" /><meta http-equiv=\"refresh\" content=\"0; url=%s \" />", path);
     
-    int username_len = (int)strlen(username);
-    int message_len = (int)strlen(message);
-    expect(sqlite3_bind_text(insert_stmt, 1, username, username_len, NULL) == SQLITE_OK);
-    expect(sqlite3_bind_text(insert_stmt, 2, message, message_len, NULL) == SQLITE_OK);
-    expect(sqlite3_step(insert_stmt) == SQLITE_DONE);
-    expect(sqlite3_reset(insert_stmt) == SQLITE_OK);
+    // StrCons sc = strcons_create(ev_arena);
+    // strcons_append_t(&sc, "HX-Redirect: ");
+    // strcons_append_t(&sc, path);
+    // strcons_append_t(&sc, "\r\n");
+    // char *header = strcons_str_t(&sc);
+    // mg_http_reply(c, 200, header, "");
 }
 
-// returned str must be freed
-struct mg_str read_rows(void) {
-    size_t bufsize = 4096;
+User *get_user(Arena *arena, ID id) {
+    sql_ok(sql_bind_uint(stmt_get_user, 1, id));
+    int ret = sqlite3_step(stmt_get_user);
+    if (ret == SQLITE_DONE) {
+        sql_ok(sqlite3_reset(stmt_get_user));
+        return NULL;
+    }
+    expect(ret == SQLITE_ROW);
     
-    char *buf = malloc(bufsize);
-    size_t head = 0;
+    const char *username = (const char*)sqlite3_column_text(stmt_get_user, 1);
+    const char *email = (const char*)sqlite3_column_text(stmt_get_user, 2);
+    U64 login_salt = (U64)sqlite3_column_int64(stmt_get_user, 3);
+    U64 login_hash = (U64)sqlite3_column_int64(stmt_get_user, 4);
+    sql_ok(sqlite3_reset(stmt_get_user));
     
-    head = (size_t)snprintf(buf, bufsize, "<div id=chat>");
+    User *user = arena_alloc(arena, sizeof(*user), alignof(*user));
+    *user = (User) {
+        id,
+        arena_strdup_t(arena, username),
+        arena_strdup_t(arena, email),
+        login_salt,
+        login_hash
+    };
+    return user;
+}
+
+U64 compute_login_hash(U64 login_salt, Str password) {
+    mg_sha256_ctx sha_ctx;
+    mg_sha256_init(&sha_ctx);
+    U64 sha[4];
+    mg_sha256_update(&sha_ctx, (void*)&login_salt, sizeof(login_salt));
+    mg_sha256_update(&sha_ctx, (void*)password.buf, password.len);
+    mg_sha256_final((void*)&sha, &sha_ctx);
+    return sha[0];
+}
+
+Str signup(Str username, Str email, Str password) {
+    // TODO validation
+
+    // generate salt
+    U64 login_salt;
+    expect(mg_random(&login_salt, sizeof(login_salt)));
+    
+    // compute password hash
+    U64 login_hash = compute_login_hash(login_salt, password);
+    
+    // generate id
+    ID id = 0;
+    while (1) {
+        expect(mg_random(&id, sizeof(id)));
+        if (id == 0) continue;
+        
+        // ensure id doesn't exist
+        sql_ok(sql_bind_uint(stmt_get_user, 1, id));
+        int ret = sqlite3_step(stmt_get_user);
+        sql_ok(sqlite3_reset(stmt_get_user));
+        if (ret == SQLITE_DONE)
+            break;
+        expect(ret == SQLITE_ROW);
+    }
+    
+    // insert user
+    sql_ok(sql_bind_uint(stmt_signup, 1, id));
+    sql_ok(sql_bind_str(stmt_signup, 2, username));
+    sql_ok(sql_bind_str(stmt_signup, 3, email));
+    sql_ok(sql_bind_uint(stmt_signup, 4, login_hash));
+    sql_ok(sql_bind_uint(stmt_signup, 5, login_salt));
+    sql_done(sqlite3_step(stmt_signup));
+    sql_ok(sqlite3_reset(stmt_signup));
+    
+    return NULL_STR;
+}
+
+// login fns return id 0 if invalid
+
+User *get_user_from_id_password(ID id, Str password) {
+    User *user = get_user(ev_arena, id);
+    if (user == NULL) return NULL;
+    U64 login_hash = compute_login_hash(user->login_salt, password);
+    if (login_hash == user->login_hash)
+        return user;
+    return NULL;
+}
+
+User *get_user_from_login(Str username_or_email, Str password) {
+    // check ids with matching username
+    {
+        sql_ok(sql_bind_str(stmt_username_id, 1, username_or_email));
+        int ret = sqlite3_step(stmt_username_id);
+        
+        User *user = NULL;
+        while (ret == SQLITE_ROW) {
+            ID id = (ID)sqlite3_column_int64(stmt_username_id, 0);
+            user = get_user_from_id_password(id, password);
+            if (user) break;
+        }
+        expect(ret == SQLITE_ROW || ret == SQLITE_DONE);
+        sql_ok(sqlite3_reset(stmt_username_id));
+        if (user) return user;
+    }
+
+    // check ids with matching email
+    {
+        sql_ok(sql_bind_str(stmt_email_id, 1, username_or_email));
+        int ret = sqlite3_step(stmt_email_id);
+        
+        User *user = NULL;
+        while (ret == SQLITE_ROW) {
+            ID id = (ID)sqlite3_column_int64(stmt_email_id, 0);
+            user = get_user_from_id_password(id, password);
+            if (user) break;
+        }
+        expect(ret == SQLITE_ROW || ret == SQLITE_DONE);
+        sql_ok(sqlite3_reset(stmt_email_id));
+        return user;
+    }
+}
+
+// automatically responds
+void login_user(struct mg_connection *c, Str username_or_email, Str password) {
+    User *user = get_user_from_login(username_or_email, password);
+    if (user == NULL) {
+        mg_serve_str(c, mg_str("login details are invalid"));
+        return;
+    }
+        
+    // generate unique session_id
+    ID session_id = 0;
+    while (1) {
+        expect(mg_random(&session_id, sizeof(session_id)));
+        if (session_id == 0) continue;
+        
+        // ensure id doesn't exist
+        sql_ok(sql_bind_uint(stmt_session_user, 1, session_id));
+        int ret = sqlite3_step(stmt_session_user);
+        sql_ok(sqlite3_reset(stmt_session_user));
+        if (ret == SQLITE_DONE)
+            break;
+        expect(ret == SQLITE_ROW);
+    }
+    
+    // insert session
+    sql_ok(sql_bind_uint(stmt_add_session, 1, session_id));
+    sql_ok(sql_bind_uint(stmt_add_session, 2, user->id));
+    sql_done(sqlite3_step(stmt_add_session));
+    sql_ok(sqlite3_reset(stmt_add_session));
+    
+    // set session cookie
+    StrCons sc = strcons_create(ev_arena);
+    strcons_append_t(&sc, "Content-Type: text/html; charset=utf-8\r\n");
+    strcons_append_t(&sc, "Set-Cookie: session_id=");
+    strcons_append(&sc, format_id(ev_arena, session_id));
+    strcons_append_t(&sc, "; Secure; HttpOnly; SameSite=Lax\r\n");
+    char *headers = strcons_str_t(&sc);
+    
+    // navigate to base app
+    mg_http_reply(c, 200, headers, "<meta charset=\"utf-8\" /><meta http-equiv=\"refresh\" content=\"0; url=/ \" />");
+}
+
+void post_message(ID id, Str message) {
+    sql_ok(sql_bind_uint(stmt_post_message, 1, id));
+    sql_ok(sql_bind_str(stmt_post_message, 2, message));
+    sql_done(sqlite3_step(stmt_post_message));
+    sql_ok(sqlite3_reset(stmt_post_message));
+}
+
+Str read_history(Arena *arena) {
+    StrCons sc = strcons_create(arena);
+    
+    strcons_append_t(&sc, "<div id=chat>");
     
     while (1) {
-        int ret = sqlite3_step(read_stmt);
+        int ret = sqlite3_step(stmt_read_history);
         if (ret == SQLITE_DONE) break;
         expect(ret == SQLITE_ROW);
         
-        const unsigned char *username = sqlite3_column_text(read_stmt, 0);
-        const unsigned char *message = sqlite3_column_text(read_stmt, 1);
+        const char *username = (const char*)sqlite3_column_text(stmt_read_history, 0);
+        const char *message = (const char*)sqlite3_column_text(stmt_read_history, 1);
         
-        while (1) {
-            size_t left = bufsize - head;
-            size_t written = (size_t)snprintf(buf + head, left, "%s: %s<br>", username, message);
-            expect(written > 0);
-            
-            if (written < left) {
-                head += written;
-                break;
-            } else {
-                // output truncated - realloc and try again
-                bufsize *= 2;
-                buf = realloc(buf, bufsize);
-            }
-        }
+        strcons_append_t(&sc, username);
+        strcons_append_t(&sc, ": ");
+        strcons_append_t(&sc, message);
+        strcons_append_t(&sc, "<br>");
     }
     
-    // TODO this can oob
-    head += (size_t)snprintf(buf + head, bufsize - head, "</div>");
+    strcons_append_t(&sc, "</div>");
+    expect(sqlite3_reset(stmt_read_history) == SQLITE_OK);
     
-    expect(sqlite3_reset(read_stmt) == SQLITE_OK);
-    
-    return (struct mg_str) { .buf = buf, .len = head };
+    return strcons_str(&sc);
 }
 
 void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
+    arena_clear(ev_arena);
+    
     if (ev == MG_EV_HTTP_MSG) {
         struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+        struct mg_http_serve_opts opts = { .root_dir = "./web_root/" };
+        
         mg_print_str("URI: ", hm->uri);
         
+        ID session_id = 0;
+        Str *cookie = mg_http_get_header(hm, "Cookie");
+        if (cookie) session_id = parse_id(*cookie);
+        
         if (mg_match(hm->uri, mg_str("/ws"), NULL)) {
+            // TODO only upgrade if session cookie passed
             mg_ws_upgrade(c, hm, NULL);
             c->data[0] = 'W';
             
-            struct mg_str items = read_rows();
-            mg_ws_send(c, items.buf, items.len, WEBSOCKET_OP_TEXT);
+            Str ws_chat = read_history(ev_arena);
+            mg_ws_send(c, ws_chat.buf, ws_chat.len, WEBSOCKET_OP_TEXT);
         }
-        else {
-            struct mg_http_serve_opts opts = { .root_dir = "./web_root/" };
-            mg_http_serve_dir(c, hm, &opts);
+        else if (mg_match(hm->uri, mg_str("/"), NULL)) {
+            if (session_id == 0) {
+                // not logged in - show login html
+                mg_http_redirect(c, "login");
+            } else {
+                printf("base\n");
+                // logged in - show app
+                mg_http_serve_file(c, hm, "web_root/base.html", &opts);
+            }
         }
+        else if (mg_match(hm->uri, mg_str("/login/"), NULL)) {
+            mg_http_serve_file(c, hm, "web_root/login.html", &opts);
+        }
+        else if (mg_match(hm->uri, mg_str("/login/login-user"), NULL)) {
+            Str username_or_email = mg_http_var(hm->body, mg_str("username_or_email"));
+            Str password = mg_http_var(hm->body, mg_str("password"));
+            if (str_null(username_or_email)) goto INVALID_HS;
+            if (str_null(password)) goto INVALID_HS;
+            
+            login_user(c, username_or_email, password);
+        }
+        else if (mg_match(hm->uri, mg_str("/htmx.js"), NULL)) {
+            mg_http_serve_file(c, hm, "web_root/htmx.js", &opts);
+        }
+        else if (mg_match(hm->uri, mg_str("/htmx-ws.js"), NULL)) {
+            mg_http_serve_file(c, hm, "web_root/htmx-ws.js", &opts);
+        }
+        
+        return;
+        INVALID_HS:
+        mg_bad_request(c);
     }
     else if (ev == MG_EV_WS_MSG) {
         struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
-        mg_print_str("WS DATA: ", wm->data);
         
-        char *todo = mg_json_get_str(wm->data, "$.HEADERS.HX-Target");
-        expect(todo != NULL);
+        char *task = mg_json_get_str(wm->data, "$.HEADERS.HX-Target");
+        if (task == NULL) goto INVALID_WS;
         
-        if (strcmp(todo, "post-message") == 0) {
-            char *username = mg_json_get_str(wm->data, "$.username");
-            char *message = mg_json_get_str(wm->data, "$.message");
-            expect(username != NULL);
-            expect(message != NULL);
-            insert_row(username, message);
+        if (strcmp(task, "post-message") == 0) {
+            /*U64 id = mg_ws_get_id(wm);
+            Str message = str_create(mg_json_get_str(wm->data, "$.message"));
             
-            struct mg_str items = read_rows();
-            printf("broadcasting...\n");
+            if (id == 0) goto INVALID_WS;
+            if (str_null(message)) goto INVALID_WS;
+            post_message(id, message);
+            
+            Str history = read_history(ev_arena);
             for (struct mg_connection *wc = c->mgr->conns; wc != NULL; wc = wc->next) {
                 if (wc->data[0] == 'W')
-                    mg_ws_send(wc, items.buf, items.len, WEBSOCKET_OP_TEXT);
-            }
-            free(items.buf); 
+                    mg_ws_send(wc, history.buf, history.len, WEBSOCKET_OP_TEXT);
+            }*/
         }
+        else if (strcmp(task, "signup") == 0) {
+            // TODO move to http
+            
+            char *username = mg_json_get_str(wm->data, "$.username");
+            char *email = mg_json_get_str(wm->data, "$.email");
+            char *password = mg_json_get_str(wm->data, "$.password");
+            if (username == NULL) goto INVALID_WS;
+            if (email == NULL) goto INVALID_WS;
+            if (password == NULL) goto INVALID_WS;
+            
+            Str err = signup(str_create(username), str_create(email), str_create(password));
+            if (!str_null(err)) {
+                mg_ws_send(c, err.buf, err.len, WEBSOCKET_OP_TEXT);
+            } else {
+                // TODO
+            }
+        }
+        return;
+        
+        INVALID_WS:
+        mg_print_str("INVALID WS: ", wm->data);
     }
 }
 
 int main(void) {
-    // INIT DB --------------------------------------------
+    // INIT --------------------------------------------
     
     expect(sqlite3_open_v2("db.sqlite", &db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK);
     
-    const char sql_insert[] = "INSERT INTO chatlog VALUES ( ?, ? );";
-    const char sql_read[]   = "SELECT username, message FROM chatlog;";
+    sql_ok(sqlite3_prepare_v2(db, sql_post_message, sizeof(sql_post_message), &stmt_post_message, NULL));
+    sql_ok(sqlite3_prepare_v2(db, sql_login, sizeof(sql_login), &stmt_login, NULL));
+    sql_ok(sqlite3_prepare_v2(db, sql_signup, sizeof(sql_signup), &stmt_signup, NULL));
+    sql_ok(sqlite3_prepare_v2(db, sql_read_history, sizeof(sql_read_history), &stmt_read_history, NULL));
+    sql_ok(sqlite3_prepare_v2(db, sql_username_id, sizeof(sql_username_id), &stmt_username_id, NULL));
+    sql_ok(sqlite3_prepare_v2(db, sql_email_id, sizeof(sql_email_id), &stmt_email_id, NULL));
+    sql_ok(sqlite3_prepare_v2(db, sql_get_user, sizeof(sql_get_user), &stmt_get_user, NULL));
+    sql_ok(sqlite3_prepare_v2(db, sql_add_session, sizeof(sql_add_session), &stmt_add_session, NULL));
+    sql_ok(sqlite3_prepare_v2(db, sql_session_user, sizeof(sql_session_user), &stmt_session_user, NULL));
     
-    expect(sqlite3_prepare_v2(db, sql_insert, sizeof(sql_insert), &insert_stmt, NULL) == SQLITE_OK);
-    expect(sqlite3_prepare_v2(db, sql_read, sizeof(sql_read), &read_stmt, NULL) == SQLITE_OK);
+    Arena arena = arena_create(1ull << 30ull); // 1gb
+    ev_arena = &arena;
     
     // RUN SERVER ------------------------------------------
 
@@ -145,5 +410,6 @@ int main(void) {
     while (true) {
         mg_mgr_poll(&mgr, -1);
     }
+    
     return 0;
 }

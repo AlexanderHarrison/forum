@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Testing!</title>
+    <script src="/htmx.js"></script>
+    <script src="/htmx-ws.js"></script>
+</head>
+<body>
+<div id="main">
+    <form hx-post="login-user" hx-target="#err">
+        <label for="username_or_email">Username / Email:</label>
+        <input type="text" id="username_or_email" name="username_or_email"/><br>
+        <br>
+        <label for="password">Password:</label>
+        <input type="password" id="password" name="password"/><br>
+        
+        <div id="err"></div>
+        
+        <input type="submit" value="Log in" />
+    </form>
+    
+</div>
+</body>
+</html>
