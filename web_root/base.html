@@ -9,8 +9,22 @@
 </head>
 <body>
 <div hx-ext="ws" ws-connect="/ws">
-    <div id="main"></div>
+    <div id="chat"></div>
+    <hr>
+    <div id="user-info"></div>
+    
+    <form id="post-message" ws-send>
+        <label for="message">Message:</label>
+        <input type="text" id="message" name="message"/><br>
+        
+        <input type="submit" value="Post!"/>
+    </form>
 </div>
+
+<form hx-post="logout" hx-target="this">
+    <input type="submit" value="Log out"/>
+</form>
+
 </body>
 </html>
 
